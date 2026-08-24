@@ -6,9 +6,9 @@ Subscribes to MQTT detection topics, runs per-camera ByteTrack instances,
 and publishes tracked detections with track IDs.
 """
 
-import argparse
 import json
 import logging
+import os
 import sys
 import time
 from collections import defaultdict
@@ -26,7 +26,6 @@ class TrackerService:
 
     def __init__(
         self,
-        device_id: str,
         broker_host: str,
         broker_port: int,
         username: Optional[str] = None,
@@ -36,7 +35,6 @@ class TrackerService:
         track_buffer: int = 30,
         tracker_cleanup_timeout_s: float = 300.0,
     ):
-        self.device_id = device_id
         self.broker_host = broker_host
         self.broker_port = broker_port
         self.username = username
@@ -47,9 +45,11 @@ class TrackerService:
         self.match_thresh = match_thresh
         self.track_buffer = track_buffer
 
-        # Per-camera tracker instances and last-seen timestamps
-        self.trackers: Dict[int, ByteTrack] = {}
-        self.tracker_last_seen: Dict[int, float] = {}
+        # Per-(device, camera) tracker instances and last-seen timestamps.
+        # Keyed by (device_id, camera_id) since a single service instance now
+        # handles all devices, and camera IDs are only unique within a device.
+        self.trackers: Dict[tuple[str, int], ByteTrack] = {}
+        self.tracker_last_seen: Dict[tuple[str, int], float] = {}
         self.tracker_cleanup_timeout = tracker_cleanup_timeout_s
 
         # MQTT client
@@ -61,38 +61,53 @@ class TrackerService:
 
         if self.username and self.password:
             self.client.username_pw_set(self.username, self.password)
+            logger.debug(f"MQTT authentication configured for user '{self.username}'")
+        elif self.username or self.password:
+            logger.warning(
+                "Only one of MQTT_USERNAME/MQTT_PASSWORD was provided; MQTT authentication "
+                "requires both, so connecting without authentication"
+            )
 
-    def _get_or_create_tracker(self, camera_id: int) -> ByteTrack:
-        """Get existing tracker for camera or create new one."""
-        if camera_id not in self.trackers:
+    def _get_or_create_tracker(self, device_id: str, camera_id: int) -> ByteTrack:
+        """Get existing tracker for (device, camera) or create new one."""
+        key = (device_id, camera_id)
+        if key not in self.trackers:
             logger.info(
-                f"Creating new tracker for camera {camera_id} "
+                f"Creating new tracker for device {device_id}, camera {camera_id} "
                 f"(track_thresh={self.track_thresh}, match_thresh={self.match_thresh}, "
                 f"track_buffer={self.track_buffer})"
             )
-            self.trackers[camera_id] = ByteTrack(
+            self.trackers[key] = ByteTrack(
                 track_thresh=self.track_thresh,
                 match_thresh=self.match_thresh,
                 track_buffer=self.track_buffer,
             )
-        return self.trackers[camera_id]
+        return self.trackers[key]
 
     def _cleanup_stale_trackers(self) -> None:
         """Remove trackers that haven't been used recently."""
         now = time.time()
-        stale_cameras = [
-            camera_id
-            for camera_id, last_seen in self.tracker_last_seen.items()
+        stale_keys = [
+            key
+            for key, last_seen in self.tracker_last_seen.items()
             if now - last_seen > self.tracker_cleanup_timeout
         ]
 
-        for camera_id in stale_cameras:
-            logger.info(
-                f"Cleaning up tracker for camera {camera_id} "
-                f"(idle for {now - self.tracker_last_seen[camera_id]:.1f}s)"
+        if not stale_keys:
+            logger.debug(
+                f"Stale tracker cleanup ran, nothing to evict "
+                f"({len(self.trackers)} active tracker(s))"
             )
-            del self.trackers[camera_id]
-            del self.tracker_last_seen[camera_id]
+            return
+
+        for key in stale_keys:
+            device_id, camera_id = key
+            logger.info(
+                f"Cleaning up tracker for device {device_id}, camera {camera_id} "
+                f"(idle for {now - self.tracker_last_seen[key]:.1f}s)"
+            )
+            del self.trackers[key]
+            del self.tracker_last_seen[key]
 
     def _mqtt_message_to_detections(
         self, mqtt_payload: str,
@@ -112,6 +127,10 @@ class TrackerService:
         detections = payload.get("detections", [])
 
         if not detections:
+            logger.debug(
+                f"Frame {payload.get('frame_count')} (camera {payload.get('camera_id')}) "
+                f"has no detections"
+            )
             return np.empty((0, 6), dtype=np.float32), payload
 
         img_w = payload.get("image_width")
@@ -183,8 +202,8 @@ class TrackerService:
         """MQTT callback: on connect."""
         if rc == 0:
             logger.info(f"Connected to MQTT broker at {self.broker_host}:{self.broker_port}")
-            # Subscribe to all detections for this device
-            topic = f"edge/{self.device_id}/data/detections/+"
+            # Subscribe to detections for all devices and cameras
+            topic = "cloud/+/detections/+"
             logger.info(f"Subscribing to topic: {topic}")
             client.subscribe(topic, qos=0)
         else:
@@ -204,14 +223,20 @@ class TrackerService:
     def _on_message(self, client, userdata, msg):
         """MQTT callback: on message received."""
         try:
-            # Parse topic to extract camera_id
+            logger.debug(
+                f"Received message on topic '{msg.topic}' ({len(msg.payload)} bytes)"
+            )
+
+            # Parse topic to extract device_id and camera_id
+            # Expected format: cloud/<device_id>/detections/<camera_id>
             topic_parts = msg.topic.split("/")
-            if len(topic_parts) < 5:
+            if len(topic_parts) < 4:
                 logger.warning(f"Invalid topic format: {msg.topic}")
                 return
 
+            device_id = topic_parts[1]
             try:
-                camera_id = int(topic_parts[4])
+                camera_id = int(topic_parts[3])
             except (ValueError, IndexError):
                 logger.warning(f"Could not parse camera_id from topic: {msg.topic}")
                 return
@@ -223,23 +248,32 @@ class TrackerService:
                 logger.error(f"Failed to parse detection message: {e}")
                 return
 
-            # Get or create tracker for this camera
-            tracker = self._get_or_create_tracker(camera_id)
-            self.tracker_last_seen[camera_id] = time.time()
+            # Get or create tracker for this device/camera
+            tracker = self._get_or_create_tracker(device_id, camera_id)
+            self.tracker_last_seen[(device_id, camera_id)] = time.time()
 
             # Create frame for BoxMOT (pixel content not used by ByteTrack)
+            if payload.get("image_height") is None or payload.get("image_width") is None:
+                logger.warning(
+                    f"Device {device_id}, camera {camera_id}: image_width/image_height "
+                    f"missing from payload, defaulting to 640x480 for the dummy tracker frame"
+                )
             img_h = payload.get("image_height", 480)
             img_w = payload.get("image_width", 640)
             frame = np.zeros((img_h, img_w, 3), dtype=np.uint8)
 
             # Update tracker and get tracks
             tracks = tracker.update(dets, frame)
+            logger.debug(
+                f"Device {device_id}, camera {camera_id}: tracker.update() got "
+                f"{len(dets)} detection(s), returned {len(tracks)} track(s)"
+            )
 
             # Add track IDs to detections in payload
             tracked_payload = self._update_detections_with_tracks(payload, tracks)
 
             # Publish tracked detections
-            publish_topic = f"edge/{self.device_id}/data/tracked_detections/{camera_id}"
+            publish_topic = f"cloud/{device_id}/tracked_detections/{camera_id}"
             try:
                 result = client.publish(
                     publish_topic,
@@ -273,7 +307,9 @@ class TrackerService:
                 f"Connecting to MQTT broker at {self.broker_host}:{self.broker_port}"
             )
             self.client.connect(self.broker_host, self.broker_port, keepalive=60)
+            logger.debug("Entering MQTT network loop (loop_forever)")
             self.client.loop_forever()
+            logger.info("MQTT loop exited")
         except Exception as e:
             logger.error(f"Failed to start tracker service: {e}", exc_info=True)
             sys.exit(1)
@@ -283,91 +319,85 @@ class TrackerService:
         logger.info("Stopping tracker service")
         self.client.disconnect()
         self.client.loop_stop()
+        logger.info(f"Tracker service stopped ({len(self.trackers)} tracker(s) discarded)")
+
+
+
+# Environment variable names and defaults for all service configuration.
+# CLI flags were removed in favor of env vars so the service is easy to
+# configure via Docker/Kubernetes/systemd without touching an entrypoint.
+_ENV_DEFAULTS = {
+    "MQTT_BROKER_HOST": "localhost",
+    "MQTT_BROKER_PORT": "1883",
+    "MQTT_USERNAME": "",
+    "MQTT_PASSWORD": "",
+    "TRACK_THRESH": "0.5",
+    "MATCH_THRESH": "0.8",
+    "TRACK_BUFFER": "30",
+    "CLEANUP_TIMEOUT": "300.0",
+    "LOG_LEVEL": "INFO",
+}
+
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+def _load_config_from_env() -> dict:
+    """Read and validate service configuration from environment variables."""
+    env = {key: os.environ.get(key, default) for key, default in _ENV_DEFAULTS.items()}
+
+    log_level = env["LOG_LEVEL"].upper()
+    if log_level not in _LOG_LEVELS:
+        raise ValueError(
+            f"Invalid LOG_LEVEL={env['LOG_LEVEL']!r}; must be one of {_LOG_LEVELS}"
+        )
+
+    try:
+        broker_port = int(env["MQTT_BROKER_PORT"])
+        track_thresh = float(env["TRACK_THRESH"])
+        match_thresh = float(env["MATCH_THRESH"])
+        track_buffer = int(env["TRACK_BUFFER"])
+        cleanup_timeout = float(env["CLEANUP_TIMEOUT"])
+    except ValueError as e:
+        raise ValueError(f"Invalid numeric environment variable: {e}")
+
+    return {
+        "broker_host": env["MQTT_BROKER_HOST"],
+        "broker_port": broker_port,
+        "username": env["MQTT_USERNAME"] or None,
+        "password": env["MQTT_PASSWORD"] or None,
+        "track_thresh": track_thresh,
+        "match_thresh": match_thresh,
+        "track_buffer": track_buffer,
+        "cleanup_timeout": cleanup_timeout,
+        "log_level": log_level,
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Cloud-based tracker service for edge-inference detection streams"
-    )
-    parser.add_argument(
-        "--device-id",
-        required=True,
-        help="Device ID to subscribe to (e.g., edge-AABBCCDDEEFF)",
-    )
-    parser.add_argument(
-        "--broker-host",
-        default="localhost",
-        help="MQTT broker hostname (default: localhost)",
-    )
-    parser.add_argument(
-        "--broker-port",
-        type=int,
-        default=1883,
-        help="MQTT broker port (default: 1883)",
-    )
-    parser.add_argument(
-        "--username",
-        default=None,
-        help="MQTT broker username (optional)",
-    )
-    parser.add_argument(
-        "--password",
-        default=None,
-        help="MQTT broker password (optional)",
-    )
-    parser.add_argument(
-        "--track-thresh",
-        type=float,
-        default=0.5,
-        help="ByteTrack confidence threshold for new tracks (default: 0.5)",
-    )
-    parser.add_argument(
-        "--match-thresh",
-        type=float,
-        default=0.8,
-        help="ByteTrack IoU threshold for matching (default: 0.8)",
-    )
-    parser.add_argument(
-        "--track-buffer",
-        type=int,
-        default=30,
-        help="ByteTrack frames to keep lost tracks alive (default: 30)",
-    )
-    parser.add_argument(
-        "--cleanup-timeout",
-        type=float,
-        default=300.0,
-        help="Seconds before removing idle tracker (default: 300s)",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)",
-    )
-
-    args = parser.parse_args()
+    try:
+        config = _load_config_from_env()
+    except ValueError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Configure logging
     logging.basicConfig(
-        level=getattr(logging, args.log_level),
+        level=getattr(logging, config["log_level"]),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
     logger.info("Starting cloud tracker service")
-    logger.info(f"Configuration: device_id={args.device_id}, "
-                f"broker={args.broker_host}:{args.broker_port}")
+    logger.info(f"Configuration: broker={config['broker_host']}:{config['broker_port']}")
 
     service = TrackerService(
-        device_id=args.device_id,
-        broker_host=args.broker_host,
-        broker_port=args.broker_port,
-        username=args.username,
-        password=args.password,
-        track_thresh=args.track_thresh,
-        match_thresh=args.match_thresh,
-        track_buffer=args.track_buffer,
-        tracker_cleanup_timeout_s=args.cleanup_timeout,
+        broker_host=config["broker_host"],
+        broker_port=config["broker_port"],
+        username=config["username"],
+        password=config["password"],
+        track_thresh=config["track_thresh"],
+        match_thresh=config["match_thresh"],
+        track_buffer=config["track_buffer"],
+        tracker_cleanup_timeout_s=config["cleanup_timeout"],
     )
 
     try:

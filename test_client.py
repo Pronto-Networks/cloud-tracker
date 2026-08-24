@@ -66,7 +66,7 @@ class TestClient:
         if rc == 0:
             print(f"✓ Connected to {self.broker_host}:{self.broker_port}")
             # Subscribe to tracked results for all cameras
-            topic = f"edge/{self.device_id}/data/tracked_detections/+"
+            topic = f"cloud/{self.device_id}/tracked_detections/+"
             print(f"✓ Subscribing to: {topic}")
             client.subscribe(topic, qos=0)
         else:
@@ -98,7 +98,7 @@ class TestClient:
 
     def publish_detection(self, camera_id: int, frame_count: int, num_detections: int = 2):
         """Publish a sample detection message."""
-        topic = f"edge/{self.device_id}/data/detections/{camera_id}"
+        topic = f"cloud/{self.device_id}/detections/{camera_id}"
         payload = create_sample_detection(camera_id, frame_count, num_detections)
 
         try:

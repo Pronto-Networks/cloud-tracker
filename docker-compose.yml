@@ -1,0 +1,28 @@
+services:
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+    restart: unless-stopped
+
+  tracker:
+    build: .
+    depends_on:
+      - mqtt
+    environment:
+      MQTT_BROKER_HOST: mqtt
+      MQTT_BROKER_PORT: "1883"
+      MQTT_USERNAME: ""
+      MQTT_PASSWORD: ""
+      TRACK_THRESH: "0.5"
+      MATCH_THRESH: "0.8"
+      TRACK_BUFFER: "30"
+      CLEANUP_TIMEOUT: "300.0"
+      LOG_LEVEL: "INFO"
+    restart: unless-stopped
+
+volumes:
+  mosquitto_data:
