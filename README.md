@@ -215,40 +215,6 @@ docker run --rm \
   cloud-tracker
 ```
 
-### Systemd Service
-
-Create `/etc/systemd/system/cloud-tracker.service`:
-
-```ini
-[Unit]
-Description=Cloud Tracker Service
-After=network.target
-
-[Service]
-Type=simple
-User=tracker
-WorkingDirectory=/opt/cloud-tracker
-Environment=MQTT_BROKER_HOST=mqtt.example.com
-Environment=MQTT_BROKER_PORT=1883
-Environment=LOG_LEVEL=INFO
-ExecStart=/usr/bin/python3 /opt/cloud-tracker/tracker_service.py
-
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then:
-```bash
-sudo systemctl enable cloud-tracker
-sudo systemctl start cloud-tracker
-sudo journalctl -u cloud-tracker -f
-```
-
 ## Troubleshooting
 
 **Service won't connect to MQTT broker:**
@@ -267,7 +233,3 @@ sudo journalctl -u cloud-tracker -f
 **Missing track IDs on some detections:**
 - Check confidence thresholds; low-confidence detections may not be tracked
 - Verify `TRACK_THRESH` is not filtering out valid detections
-
-## License
-
-This service is part of the edge-inference project.

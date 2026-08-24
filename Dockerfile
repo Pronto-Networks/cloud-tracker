@@ -5,8 +5,11 @@ LABEL description="Cloud-based object tracker for edge-inference detection strea
 
 WORKDIR /app
 
-# Install system dependencies (none needed for this service)
-RUN apt-get update && apt-get clean && rm -rf /var/lib/apt/lists/*
+# Install system dependencies required by opencv-python (pulled in transitively via boxmot)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
 COPY requirements.txt .
