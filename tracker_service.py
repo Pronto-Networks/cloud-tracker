@@ -9,6 +9,7 @@ and publishes tracked detections with track IDs.
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -19,6 +20,8 @@ import paho.mqtt.client as mqtt
 from boxmot import ByteTrack
 
 logger = logging.getLogger(__name__)
+
+SHARED_SUBSCRIPTION_GROUP = "cloud-tracker"
 
 
 class TrackerService:
@@ -52,6 +55,11 @@ class TrackerService:
         self.tracker_last_seen: Dict[tuple[str, int], float] = {}
         self.tracker_cleanup_timeout = tracker_cleanup_timeout_s
 
+        # Last frame_count per (device, camera) and how many frames arrived with a
+        # frame_count not higher than the previous one (logged, not dropped).
+        self.last_frame_count: Dict[tuple[str, int], int] = {}
+        self.out_of_order_frames: Dict[tuple[str, int], int] = defaultdict(int)
+
         # MQTT client
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
         self.client.on_connect = self._on_connect
@@ -84,8 +92,30 @@ class TrackerService:
             )
         return self.trackers[key]
 
+    def _check_frame_order(self, key: tuple[str, int], frame_count) -> None:
+        """Count frames whose frame_count is not higher than the previous frame's.
+
+        ByteTrack assumes frames in order; this only measures how often that is violated.
+        """
+        if not isinstance(frame_count, int):
+            return
+
+        last = self.last_frame_count.get(key)
+        if last is not None and frame_count <= last:
+            self.out_of_order_frames[key] += 1
+            logger.debug(f"Out-of-order frame for {key}: frame_count {frame_count} after {last}")
+        self.last_frame_count[key] = frame_count
+
+    def _report_out_of_order_frames(self) -> None:
+        for (device_id, camera_id), count in self.out_of_order_frames.items():
+            logger.info(
+                f"Device {device_id}, camera {camera_id}: {count} out-of-order frame(s) since last report"
+            )
+        self.out_of_order_frames.clear()
+
     def _cleanup_stale_trackers(self) -> None:
         """Remove trackers that haven't been used recently."""
+        self._report_out_of_order_frames()
         now = time.time()
         stale_keys = [
             key
@@ -108,15 +138,19 @@ class TrackerService:
             )
             del self.trackers[key]
             del self.tracker_last_seen[key]
+            self.last_frame_count.pop(key, None)
 
     def _mqtt_message_to_detections(
         self, mqtt_payload: str,
-    ) -> tuple[np.ndarray, dict]:
+    ) -> tuple[np.ndarray, dict, list[int]]:
         """Parse MQTT detection message into numpy array and return payload dict.
 
         Returns:
-            (detections_array, payload_dict) where detections_array has shape (N, 6)
-            with columns [x1, y1, x2, y2, confidence, class_id] in pixel coordinates.
+            (detections_array, payload_dict, source_indices) where detections_array has
+            shape (N, 6) with columns [x1, y1, x2, y2, confidence, class_id] in pixel
+            coordinates, and source_indices[row] is the index of that row's detection in
+            payload["detections"] (invalid detections are skipped, so rows and detections
+            do not line up one-to-one).
         """
         try:
             payload = json.loads(mqtt_payload)
@@ -131,7 +165,7 @@ class TrackerService:
                 f"Frame {payload.get('frame_count')} (camera {payload.get('camera_id')}) "
                 f"has no detections"
             )
-            return np.empty((0, 6), dtype=np.float32), payload
+            return np.empty((0, 6), dtype=np.float32), payload, []
 
         img_w = payload.get("image_width")
         img_h = payload.get("image_height")
@@ -141,7 +175,8 @@ class TrackerService:
             raise ValueError("Missing image dimensions")
 
         rows = []
-        for det in detections:
+        source_indices = []
+        for det_idx, det in enumerate(detections):
             try:
                 bbox = det.get("bbox", [])
                 if len(bbox) != 4:
@@ -159,14 +194,18 @@ class TrackerService:
                         float(det.get("class_id", 0)),
                     ]
                 )
+                source_indices.append(det_idx)
             except (ValueError, TypeError) as e:
                 logger.warning(f"Failed to process detection: {det}, error: {e}")
                 continue
 
-        return np.array(rows, dtype=np.float32), payload
+        if not rows:
+            return np.empty((0, 6), dtype=np.float32), payload, []
+
+        return np.array(rows, dtype=np.float32), payload, source_indices
 
     def _update_detections_with_tracks(
-        self, payload: dict, tracks: np.ndarray
+        self, payload: dict, tracks: np.ndarray, source_indices: list[int]
     ) -> dict:
         """Add track_id to each detection in the original payload.
 
@@ -174,16 +213,17 @@ class TrackerService:
             payload: Original MQTT detection payload
             tracks: Array with shape (M, 8) from tracker.update():
                     [x1, y1, x2, y2, track_id, confidence, class_id, det_ind]
+                    where det_ind is the row index in the array passed to the tracker
+            source_indices: Maps a tracker input row to its index in payload["detections"]
 
         Returns:
             Modified payload with track_id added to each detection
         """
-        # Build mapping from detection index to track_id
+        # Build mapping from original detection index to track_id
         track_id_map = {}
         for track in tracks:
-            det_ind = int(track[7])  # detection index
-            track_id = int(track[4])
-            track_id_map[det_ind] = track_id
+            row = int(track[7])
+            track_id_map[source_indices[row]] = int(track[4])
 
         # Add track_id to each detection using its index
         modified_payload = json.loads(json.dumps(payload))  # Deep copy
@@ -191,7 +231,8 @@ class TrackerService:
             if det_idx in track_id_map:
                 detection["track-id"] = track_id_map[det_idx]
             else:
-                logger.warning(
+                # Normal for low-confidence or not-yet-confirmed tracks.
+                logger.debug(
                     f"Detection at index {det_idx} not found in tracker output"
                 )
                 detection["track-id"] = -1  # Untracked
@@ -202,8 +243,11 @@ class TrackerService:
         """MQTT callback: on connect."""
         if rc == 0:
             logger.info(f"Connected to MQTT broker at {self.broker_host}:{self.broker_port}")
-            # Subscribe to detections for all devices and cameras
-            topic = "cloud/+/detections/+"
+            # Subscribe to detections for all devices and cameras. Shared subscription
+            # (Mosquitto >= 1.6): with several replicas each message goes to one of them.
+            # Messages are spread per message, not per camera, so keep replicas at 1
+            # until cameras are split across replicas.
+            topic = f"$share/{SHARED_SUBSCRIPTION_GROUP}/cloud/+/detections/+"
             logger.info(f"Subscribing to topic: {topic}")
             client.subscribe(topic, qos=0)
         else:
@@ -243,13 +287,14 @@ class TrackerService:
 
             # Parse detection message
             try:
-                dets, payload = self._mqtt_message_to_detections(msg.payload.decode())
+                dets, payload, source_indices = self._mqtt_message_to_detections(msg.payload.decode())
             except (ValueError, UnicodeDecodeError) as e:
                 logger.error(f"Failed to parse detection message: {e}")
                 return
 
             # Get or create tracker for this device/camera
             tracker = self._get_or_create_tracker(device_id, camera_id)
+            self._check_frame_order((device_id, camera_id), payload.get("frame_count"))
             self.tracker_last_seen[(device_id, camera_id)] = time.time()
 
             # Create frame for BoxMOT (pixel content not used by ByteTrack)
@@ -270,7 +315,7 @@ class TrackerService:
             )
 
             # Add track IDs to detections in payload
-            tracked_payload = self._update_detections_with_tracks(payload, tracks)
+            tracked_payload = self._update_detections_with_tracks(payload, tracks, source_indices)
 
             # Publish tracked detections
             publish_topic = f"cloud/{device_id}/tracked_detections/{camera_id}"
@@ -399,6 +444,13 @@ def main():
         track_buffer=config["track_buffer"],
         tracker_cleanup_timeout_s=config["cleanup_timeout"],
     )
+
+    # Docker/Kubernetes stop the container with SIGTERM: disconnect cleanly so loop_forever returns.
+    def _handle_sigterm(signum, frame):
+        logger.info("Received SIGTERM")
+        service.stop()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     try:
         service.start()
